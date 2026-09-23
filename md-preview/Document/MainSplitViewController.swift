@@ -412,7 +412,12 @@ final class MainSplitViewController: NSSplitViewController {
     /// not a titlebar accessory (the native tab bar always renders below
     /// accessories, and would jump on every edit-mode toggle).
     func installFormattingBar(_ bar: NSView) {
-        if Self.usesNativeChromeAccessories {
+        if Self.usesFloatingFormattingBar {
+            if Self.usesNativeChromeAccessories {
+                layeredContentViewController?.nativeFindOverlay = findOverlayView
+            }
+            layeredContentViewController?.installFormattingBar(bar)
+        } else if Self.usesNativeChromeAccessories {
             formattingAccessory = installNativeChromeAccessory(bar)
         } else {
             layeredContentViewController?.installFormattingBar(bar)
@@ -427,7 +432,9 @@ final class MainSplitViewController: NSSplitViewController {
     }
 
     func removeFormattingBar() {
-        if #available(macOS 26.1, *), Self.usesNativeChromeAccessories,
+        if Self.usesFloatingFormattingBar {
+            layeredContentViewController?.removeFormattingBar()
+        } else if #available(macOS 26.1, *), Self.usesNativeChromeAccessories,
            let item = splitViewItems.dropFirst().first,
            let index = item.topAlignedAccessoryViewControllers.firstIndex(where: { $0 === formattingAccessory }) {
             item.removeTopAlignedAccessoryViewController(at: index)
@@ -446,14 +453,19 @@ final class MainSplitViewController: NSSplitViewController {
     private var formattingAccessory: NSViewController?
     private var findAccessory: NSViewController?
 
+    static var usesFloatingFormattingBar: Bool {
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+
     static var usesNativeChromeAccessories: Bool {
         if #available(macOS 27.0, *) { return false }
         if #available(macOS 26.1, *) { return true }
         return false
     }
 
-    /// Height a native chrome accessory (find bar, formatting bar) adds to
-    /// the obscured strip above the page, or 0 when it is absent or hidden.
+    /// Height a visible chrome row (native find accessory or floating
+    /// formatting overlay) adds above the page, or 0 when absent or hidden.
     /// fittingSize rather than the frame: the frame is unresolved between
     /// install and the next layout pass, exactly when callers ask.
     static func nativeAccessoryHeight(_ bar: NSView?, in window: NSWindow) -> CGFloat {
@@ -483,6 +495,9 @@ final class MainSplitViewController: NSSplitViewController {
             layeredContentViewController?.installFindOverlay(bar)
         }
         findOverlayView = bar
+        if Self.usesNativeChromeAccessories {
+            layeredContentViewController?.nativeFindOverlay = bar
+        }
         cachedEditorViewController?.findOverlay = bar
         contentViewController?.findOverlay = bar
     }
@@ -678,6 +693,7 @@ private final class LayeredContentViewController: NSViewController {
     private var legacyEditorTopConstraint: NSLayoutConstraint?
     private weak var formattingBar: NSView?
     private weak var findOverlay: NSView?
+    weak var nativeFindOverlay: NSView?
     private var formattingBarTopConstraint: NSLayoutConstraint?
     private var findOverlayTopConstraint: NSLayoutConstraint?
     private var chromeObservation: NSKeyValueObservation?
@@ -756,6 +772,9 @@ private final class LayeredContentViewController: NSViewController {
             top.constant = overlap
         }
         var editTop = overlap
+        if let find = nativeFindOverlay, !find.isHidden {
+            editTop += find.fittingSize.height
+        }
         if let find = findOverlay, find.superview === view, !find.isHidden {
             editTop += find.fittingSize.height
         }

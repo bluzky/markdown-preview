@@ -17,6 +17,7 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
 
     /// Fired on every document change — the host debounces for autosave.
     var contentDidChange: (() -> Void)?
+    var formattingDidChange: ((Int, Set<String>) -> Void)?
     /// Fired after CodeMirror has constructed and painted its initial document.
     /// The split view uses this to avoid replacing the preview with a blank WKWebView.
     var editorDidBecomeReady: (() -> Void)?
@@ -94,6 +95,12 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
     /// the 900px column and the body gutters track the preview exactly.
     func applyPageZoom(_ zoom: CGFloat) {
         webView.pageZoom = zoom
+        updateChromeZoom()
+    }
+
+    private func updateChromeZoom() {
+        guard #available(macOS 26.0, *) else { return }
+        webView.evaluateJavaScript("document.documentElement.style.setProperty('--mdp-chrome-zoom', '\(max(webView.pageZoom, 0.001))')", completionHandler: nil)
     }
 
     /// Rewrites the theme override `<style>` so a color edited in Settings
@@ -162,8 +169,9 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
         }
     }
 
-    /// The whole obscured strip — titlebar, toolbar, tab bar, visible
-    /// bottom accessories, and the formatting bar overlay.
+    /// The whole obscured strip — titlebar, toolbar, tab bar, and visible
+    /// bottom accessories. Floating formatting controls are excluded: their
+    /// clearance is page padding, not an obscured strip or scrollbar inset.
     /// contentLayoutRect already excludes the titlebar chrome, so the gap
     /// alone is that chrome's height; adding accessory heights on top
     /// double-counted them and left a blank band below the formatting bar.
@@ -181,7 +189,9 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
             // See ContentViewController.fullChromeTopInset: the safe area
             // lags accessory changes by a layout pass, so measure the bars.
             gap += MainSplitViewController.nativeAccessoryHeight(findOverlay, in: window)
-            gap += MainSplitViewController.nativeAccessoryHeight(formattingBar, in: window)
+            if !MainSplitViewController.usesFloatingFormattingBar {
+                gap += MainSplitViewController.nativeAccessoryHeight(formattingBar, in: window)
+            }
             return max(0, gap)
         }
         for accessory in window.titlebarAccessoryViewControllers
@@ -199,7 +209,8 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
         // (MainSplitViewController.formattingBarTabBarOverlap), so that
         // amount comes back off once.
         var overlays: CGFloat = 0
-        if let bar = formattingBar, bar.window === window, !bar.isHidden {
+        if !MainSplitViewController.usesFloatingFormattingBar,
+           let bar = formattingBar, bar.window === window, !bar.isHidden {
             overlays += bar.fittingSize.height
         }
         if let find = findOverlay, find.window === window, !find.isHidden {
@@ -308,6 +319,54 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
         webView.evaluateJavaScript("window.__mdEditor && window.__mdEditor.exec(\(name))") { _, _ in }
     }
 
+    func fetchHeadingLevel(_ completion: @escaping (Int) -> Void) {
+        webView.evaluateJavaScript("window.__mdEditor && window.__mdEditor.getHeadingLevel()") { result, _ in
+            completion(result as? Int ?? 0)
+        }
+    }
+
+    func fetchListStyle(_ completion: @escaping (String) -> Void) {
+        webView.evaluateJavaScript("window.__mdEditor && window.__mdEditor.getListStyle()") { result, _ in
+            completion(result as? String ?? "none")
+        }
+    }
+
+    func fetchBlockStyle(_ completion: @escaping (String) -> Void) {
+        webView.evaluateJavaScript("window.__mdEditor && window.__mdEditor.getBlockStyle()") { result, _ in
+            completion(result as? String ?? "none")
+        }
+    }
+
+    func setBlockStyle(_ style: String, language: String) {
+        webView.evaluateJavaScript("window.__mdEditor && window.__mdEditor.setBlockStyle(\(EditorHTML.jsStringLiteral(style)), \(EditorHTML.jsStringLiteral(language)))") { _, _ in }
+    }
+
+    func setListStyle(_ style: String) {
+        webView.evaluateJavaScript("window.__mdEditor && window.__mdEditor.setListStyle(\(EditorHTML.jsStringLiteral(style)))") { _, _ in }
+    }
+
+    struct LinkSelection {
+        let text: String
+        let from: Int
+        let to: Int
+    }
+
+    func fetchLinkSelection(_ completion: @escaping (LinkSelection?) -> Void) {
+        webView.evaluateJavaScript("window.__mdEditor && window.__mdEditor.getLinkSelection(true)") { result, _ in
+            guard let value = result as? [String: Any], let text = value["text"] as? String,
+                  let from = value["from"] as? Int, let to = value["to"] as? Int else {
+                completion(nil)
+                return
+            }
+            completion(LinkSelection(text: text, from: from, to: to))
+        }
+    }
+
+    func insertLink(text: String, url: String, from: Int, to: Int) {
+        let script = "window.__mdEditor && window.__mdEditor.insertLinkFromPopover(\(EditorHTML.jsStringLiteral(text)), \(EditorHTML.jsStringLiteral(url)), \(from), \(to))"
+        webView.evaluateJavaScript(script) { _, _ in }
+    }
+
     func insertMarkdown(_ markdown: String,
                         from: Int,
                         to: Int,
@@ -339,6 +398,7 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
                 contentDidChange?()
             case "ready":
                 hasLoadedEditorPage = true
+                updateChromeZoom()
                 // Fresh page — the bar padding lives in the DOM and must be
                 // re-applied even when the tracked value hasn't changed,
                 // and WebKit re-derives the under-page color from the new
@@ -359,6 +419,11 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
         guard let payload = message as? [String: Any],
               let kind = payload["kind"] as? String else { return }
         switch kind {
+        case "formattingState":
+            guard let heading = payload["heading"] as? Int,
+                  (0...6).contains(heading),
+                  let commands = payload["commands"] as? [String] else { return }
+            formattingDidChange?(heading, Set(commands))
         case "findResult":
             guard let index = payload["index"] as? Int,
                   let total = payload["total"] as? Int else { return }

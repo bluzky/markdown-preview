@@ -4,6 +4,27 @@ import XCTest
 
 @MainActor
 final class EditorScrollAnchorTests: XCTestCase {
+    func testFloatingToolbarClearanceRemainsConstantAcrossZoom() async throws {
+        let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
+        for zoom in [0.5, 1.0, 2.0] {
+            for editing in [false, true] {
+                let html = editing
+                    ? EditorHTML.render(markdown: "Text", editorJavaScript: script,
+                                        configuration: .init(usesPageScrolling: true))
+                    : "<style>\(MarkdownHTML.stylesheet)</style><style>:root { --mdp-page-top-clearance: \(MarkdownHTML.appPageTopClearance)px; }</style><article class='markdown-body'>Text</article>"
+                let page = WebViewLayoutHarness(html: html, width: 650, isEditor: editing, zoom: zoom, height: 400)
+                _ = try await page.layout(texts: [], imageCount: 0)
+                let value = try await page.webView.callAsyncJavaScript("""
+                    document.documentElement.style.setProperty('--mdp-chrome-zoom', zoom);
+                    return parseFloat(getComputedStyle(document.querySelector(editing ? '.cm-scroller' : 'body')).paddingTop) * zoom;
+                    """, arguments: ["zoom": zoom, "editing": editing], in: nil, contentWorld: .page)
+                XCTAssertEqual(try XCTUnwrap(value as? Double),
+                               Double(MarkdownHTML.pagePaddingTop + MarkdownHTML.appPageTopClearance), accuracy: 1)
+                page.close()
+            }
+        }
+    }
+
     func testPreviewCodeScrollbarIsNotHiddenByInnerScrollerRule() async throws {
         let html = "<style>\(MarkdownHTML.stylesheet)</style><article class='markdown-body'><pre><code>"
             + String(repeating: "long_argument_", count: 100) + "</code></pre></article>"
@@ -96,6 +117,34 @@ final class EditorScrollAnchorTests: XCTestCase {
                     && window.__mdEditor.getMarkdown() === before;
             })()
             """)
+        XCTAssertEqual(result as? Bool, true)
+    }
+
+    func testTopClearanceIsNonEditingAndScrollsAwayWithDocument() async throws {
+        let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
+        let markdown = String(repeating: "Editable text under the floating controls.\n\n", count: 80)
+        let editor = WebViewLayoutHarness(
+            html: EditorHTML.render(markdown: markdown, editorJavaScript: script,
+                                    configuration: .init(usesPageScrolling: true)),
+            width: 900, isEditor: true, height: 400)
+        defer { editor.close() }
+        _ = try await editor.layout(texts: [], imageCount: 0)
+        let result = try await editor.webView.callAsyncJavaScript("""
+            const top = document.elementFromPoint(450, 18);
+            const nonEditingTop = !top.isContentEditable && getComputedStyle(top).cursor === 'default';
+            document.scrollingElement.scrollTop = 150;
+            for (let i = 0; i < 8; i++) { window.__layoutTestFrame(); await Promise.resolve(); }
+            const line = [...document.querySelectorAll('.cm-line')].find(el => {
+                const r = el.getBoundingClientRect();
+                return r.top >= 0 && r.top < 36;
+            });
+            if (!line) return false;
+            const rect = line.getBoundingClientRect();
+            const target = document.elementFromPoint(rect.left + 5, rect.top + 2);
+            return nonEditingTop && target.isContentEditable
+                && getComputedStyle(target).cursor === 'text'
+                && !document.getElementById('formatting-cursor-shield');
+            """, arguments: [:], in: nil, contentWorld: .page)
         XCTAssertEqual(result as? Bool, true)
     }
 
