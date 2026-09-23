@@ -400,19 +400,23 @@ final class MdPreviewUpdateTests: XCTestCase {
         let fakeRenderers = """
         <script>
         (() => {
-            function renderFake() {
+            function renderMath() {
                 document.querySelectorAll('.math:not([data-math-done="1"])').forEach((el) => {
                     el.__mdSrc = el.textContent;
                     el.dataset.mathDone = '1';
                     el.__renderCount = (el.__renderCount || 0) + 1;
                     el.innerHTML = '<span class="fake-katex">rendered-math</span>';
                 });
+            }
+            function renderMermaid() {
                 document.querySelectorAll('.mermaid-figure .mermaid:not([data-mm-done="1"])').forEach((el) => {
                     el.__mdSrc = el.textContent;
                     el.dataset.mmDone = '1';
                     el.__renderCount = (el.__renderCount || 0) + 1;
                     el.innerHTML = '<svg class="fake-mermaid"></svg>';
                 });
+            }
+            function renderCode() {
                 document.querySelectorAll('pre code[class*="language-"]:not([data-hljs-done="1"])').forEach((el) => {
                     el.__mdSrc = el.textContent;
                     el.dataset.hljsDone = '1';
@@ -420,7 +424,18 @@ final class MdPreviewUpdateTests: XCTestCase {
                     el.innerHTML = '<span class="fake-hljs">highlighted</span>';
                 });
             }
-            window.MdPreview.registerReapplier(renderFake);
+            window.MdPreview.registerRenderer({
+                id: 'fake-math', render: renderMath,
+                expensiveBlock: { cls: 'math', kind: 'math', inner: null, done: 'mathDone', attrInner: null }
+            });
+            window.MdPreview.registerRenderer({
+                id: 'fake-mermaid', render: renderMermaid,
+                expensiveBlock: { cls: 'mermaid-figure', kind: 'mm', inner: '.mermaid', done: 'mmDone', attrInner: null }
+            });
+            window.MdPreview.registerRenderer({
+                id: 'fake-code', render: renderCode,
+                expensiveBlock: { cls: 'md-code-wrap', kind: 'code', inner: 'pre > code', done: 'hljsDone', attrInner: 'pre' }
+            });
         })();
         </script>
         """

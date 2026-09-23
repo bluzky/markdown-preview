@@ -271,14 +271,16 @@ nonisolated enum MarkdownHTML {
                          vendorLoading: VendorLoading = .inline,
                          colorScheme: ColorScheme? = nil,
                          documentFont: DocumentFontSetting = .current,
-                         readerLayout: ReaderLayoutSetting = .current) -> String {
+                         readerLayout: ReaderLayoutSetting = .current,
+                         renderExtensionConfiguration: RenderExtensionConfiguration = .allEnabled) -> String {
         render(markdown: markdown,
                allowsScroll: allowsScroll,
                assetBaseHref: assetBaseHref,
                vendorLoading: vendorLoading,
                colorScheme: colorScheme,
                documentFont: documentFont,
-               readerLayout: readerLayout).html
+               readerLayout: readerLayout,
+               renderExtensionConfiguration: renderExtensionConfiguration).html
     }
 
     static func render(markdown: String,
@@ -292,7 +294,8 @@ nonisolated enum MarkdownHTML {
                        readerLayout: ReaderLayoutSetting = .current,
                        warmup: Bool = false,
                        pageTopClearance: CGFloat = 0,
-                       highlightsCode: Bool = true) -> RenderedHTML {
+                       highlightsCode: Bool = true,
+                       renderExtensionConfiguration: RenderExtensionConfiguration = .allEnabled) -> RenderedHTML {
         let frontmatter = MarkdownFrontmatter.split(markdown)
         let body = frontmatter.body
         let sourceLineOffset: Int
@@ -312,7 +315,12 @@ nonisolated enum MarkdownHTML {
         )
         let mermaidResult = renderMermaidBlocks(in: formatted)
         let mathResult = renderMathBlocks(in: mermaidResult.html, with: math)
-        let footnoteReferenceHTML = renderFootnoteReferences(in: mathResult.html, with: footnotes)
+        let extensionRun = applyRenderExtensions(
+            to: mathResult.html,
+            markdown: body,
+            configuration: renderExtensionConfiguration
+        )
+        let footnoteReferenceHTML = renderFootnoteReferences(in: extensionRun.html, with: footnotes)
         let footnoteDefinitions = renderFootnoteDefinitions(
             footnotes,
             sourceLineOffset: sourceLineOffset
@@ -339,7 +347,13 @@ nonisolated enum MarkdownHTML {
         let containsMath = mathResult.containsMath || footnoteDefinitions.containsMath
         let containsMermaid = mermaidResult.containsMermaid || footnoteDefinitions.containsMermaid
         let containsCode = detectHighlightableCode(in: bodyHTML)
-        let scrollOverride = allowsScroll ? """
+        let extensionAssets = extensionRun.active.map { $0.assets(mode: vendorLoading) }
+        let extensionCSS = extensionAssets.map(\.css)
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    let scrollOverride =
+      allowsScroll
+      ? """
         <style>
         html { overflow: auto !important; }
         body { overflow: visible !important; }
@@ -393,6 +407,11 @@ nonisolated enum MarkdownHTML {
         let morphBlock = morphdomBlock
         let mathBlock = containsMath ? katexHead(mode: vendorLoading) : VendorEmission()
         let mermaidBlock = containsMermaid ? mermaidScript(mode: vendorLoading) : VendorEmission()
+    let extensionHeadScripts = extensionAssets.map(\.headJS)
+      .filter { !$0.isEmpty }
+      .joined(separator: "\n")
+    let extensionBodyScripts = extensionAssets.map(\.bodyJS)
+      .filter { !$0.isEmpty }
         let highlightBlock = containsCode ? highlightHead(mode: vendorLoading) : VendorEmission()
         // Inline documents populate the article as soon as its <template> has
         // parsed — before the body-end vendor bundles below it — so the text
@@ -402,10 +421,11 @@ nonisolated enum MarkdownHTML {
         // the template, so the later `start()` populate is a no-op. Under
         // `.lazy` every emission's body is empty and the populate hook is
         // skipped, keeping the app-path body unchanged.
-        let earlyPopulate = vendorLoading == .inline
+    let earlyPopulate =
+      vendorLoading == .inline
             ? "<script>window.MdPreview && MdPreview.populateNow && MdPreview.populateNow();</script>"
             : ""
-        let bodyParts = [earlyPopulate, mathBlock.body, mermaidBlock.body, highlightBlock.body]
+    let bodyParts = ([earlyPopulate, mathBlock.body, mermaidBlock.body] + extensionBodyScripts + [highlightBlock.body])
             .filter { !$0.isEmpty }
         let bodyScripts = bodyParts.isEmpty ? "" : "\n" + bodyParts.joined(separator: "\n")
         // Warmup keeps the article in layout (so Mermaid's IntersectionObserver
@@ -457,6 +477,7 @@ nonisolated enum MarkdownHTML {
         \(baseTag)
         <style>\(stylesheet)</style>
         <style>:root { --mdp-page-top-clearance: \(pageTopClearance)px; }</style>
+        \(extensionCSS.isEmpty ? "" : "<style>\(extensionCSS)</style>")
         \(themeStyleBlock)
         \(scrollOverride)
         \(contentWidthOverride)
@@ -468,6 +489,7 @@ nonisolated enum MarkdownHTML {
         \(sourceBlock)
         \(mathBlock.head)
         \(mermaidBlock.head)
+        \(extensionHeadScripts)
         \(highlightBlock.head)
         </head>
         <body>
@@ -517,6 +539,5 @@ nonisolated enum MarkdownHTML {
         result += nsHtml.substring(from: cursor)
         return result
     }
-
 
 }
