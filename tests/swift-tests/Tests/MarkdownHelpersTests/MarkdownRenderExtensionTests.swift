@@ -78,6 +78,16 @@ final class MarkdownRenderExtensionTests: XCTestCase {
     XCTAssertFalse(plain.html.contains("id: 'collapsible-headings'"))
   }
 
+  func testHeadingExtensionsActivateForHeadingsOnlyInFootnoteDefinitions() {
+    let rendered = MarkdownHTML.render(
+      markdown: "Body text with no heading.[^1]\n\n[^1]: ## Footnote heading",
+      vendorLoading: .lazy
+    )
+    XCTAssertTrue(rendered.html.contains("<h2"))
+    XCTAssertTrue(rendered.html.contains("--mdp-heading-h1: #d14f6a"))
+    XCTAssertTrue(rendered.html.contains("id: 'collapsible-headings'"))
+  }
+
   @MainActor
   func testCollapsibleHeadingsHideSectionUntilNextEqualOrHigherHeading() async throws {
     let html = MarkdownHTML.makeHTML(
@@ -120,6 +130,57 @@ final class MarkdownRenderExtensionTests: XCTestCase {
     XCTAssertEqual(toggled?["introHidden"] as? Bool, true)
     XCTAssertEqual(toggled?["nestedHidden"] as? Bool, true)
     XCTAssertEqual(toggled?["secondHidden"] as? Bool, false)
+  }
+
+  @MainActor
+  func testExpandingParentPreservesNestedHeadingsOwnCollapsedState() async throws {
+    let html = MarkdownHTML.makeHTML(
+      from: "# First\n\nIntro\n\n## Nested\n\nDetails\n\n# Second\n\nVisible",
+      vendorLoading: .lazy
+    )
+    let webView = WKWebView(frame: .init(x: 0, y: 0, width: 640, height: 400))
+    webView.loadHTMLString(html, baseURL: nil)
+    while webView.isLoading {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+
+    // Collapse the nested h2, then collapse and re-expand the parent h1.
+    // Expanding the parent must not silently re-reveal the nested section.
+    let result = try await webView.evaluateJavaScript("""
+      (() => {
+        const first = document.querySelector('h1');
+        const nested = document.querySelector('h2');
+        const details = document.querySelectorAll('p')[1];
+        nested.querySelector('.mdp-collapse-toggle').click();
+        first.querySelector('.mdp-collapse-toggle').click();
+        first.querySelector('.mdp-collapse-toggle').click();
+        return {
+          firstExpanded: first.querySelector('.mdp-collapse-toggle').getAttribute('aria-expanded'),
+          nestedExpanded: nested.querySelector('.mdp-collapse-toggle').getAttribute('aria-expanded'),
+          detailsHidden: details.classList.contains('mdp-collapsed-section')
+        };
+      })()
+      """) as? [String: Any]
+    XCTAssertEqual(result?["firstExpanded"] as? String, "true")
+    XCTAssertEqual(result?["nestedExpanded"] as? String, "false")
+    XCTAssertEqual(result?["detailsHidden"] as? Bool, true)
+  }
+
+  func testCollapsedSectionsStayVisibleUnderPrintMedia() {
+    // Collapsing is a screen-only viewing convenience: printed/exported
+    // documents must render every section, and the toggle button must not
+    // appear on paper. WKWebView doesn't emulate `@media print` in tests, so
+    // this checks the generated rules are correctly scoped instead of
+    // rendered behavior.
+    let css = MarkdownHTML.collapsibleHeadersStylesheet
+    XCTAssertTrue(css.range(
+      of: #"@media screen\s*\{\s*\.markdown-body > \.mdp-collapsed-section\s*\{\s*display: none;"#,
+      options: .regularExpression
+    ) != nil)
+    XCTAssertTrue(css.range(
+      of: #"@media print\s*\{\s*\.markdown-body > \.mdp-collapsible-heading > \.mdp-collapse-toggle\s*\{\s*display: none;"#,
+      options: .regularExpression
+    ) != nil)
   }
 
   func testHostBridgeProvidesRendererAndReapplierLifecycle() {

@@ -47,8 +47,17 @@ nonisolated extension MarkdownHTML {
     .markdown-body > .mdp-collapsible-heading[data-mdp-collapsed="true"] > .mdp-collapse-toggle::after {
       transform: rotate(-45deg);
     }
-    .markdown-body > .mdp-collapsed-section {
-      display: none;
+    /* Collapsing is a viewing convenience, not a redaction: printed and
+       exported documents show every section regardless of on-screen state. */
+    @media screen {
+      .markdown-body > .mdp-collapsed-section {
+        display: none;
+      }
+    }
+    @media print {
+      .markdown-body > .mdp-collapsible-heading > .mdp-collapse-toggle {
+        display: none;
+      }
     }
     """
 
@@ -80,39 +89,72 @@ nonisolated extension MarkdownHTML {
         return nodes;
       }
 
-      function setCollapsed(heading, collapsed) {
-        heading.dataset.mdpCollapsed = collapsed ? 'true' : 'false';
-        heading.querySelector(':scope > .mdp-collapse-toggle')
-          ?.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-        for (const node of sectionNodes(heading)) {
-          node.classList.toggle('mdp-collapsed-section', collapsed);
+      // A heading's own collapsed flag only says whether ITS content should
+      // hide; whether the heading and its content are actually visible also
+      // depends on any ancestor (lower-numbered-level, still-open) heading
+      // being collapsed. Walking every heading once in document order with a
+      // stack of currently-collapsed ancestors reconciles both in one pass,
+      // instead of the previous per-toggle sibling walk that let expanding a
+      // parent blow away a nested heading's own collapsed state.
+      function reconcileVisibility(root) {
+        const stack = [];
+        for (const heading of root.querySelectorAll(headingSelector)) {
+          const level = headingLevel(heading);
+          while (stack.length && stack[stack.length - 1] >= level) stack.pop();
+          const hiddenByAncestor = stack.length > 0;
+          const collapsedHere = heading.dataset.mdpCollapsed === 'true';
+          heading.classList.toggle('mdp-collapsed-section', hiddenByAncestor);
+          heading.querySelector(':scope > .mdp-collapse-toggle')
+            ?.setAttribute('aria-expanded', collapsedHere ? 'false' : 'true');
+          for (const node of sectionNodes(heading)) {
+            node.classList.toggle('mdp-collapsed-section', hiddenByAncestor || collapsedHere);
+          }
+          if (collapsedHere) stack.push(level);
         }
         window.MdPreviewHost?.pushHeight?.();
       }
 
       function toggle(heading) {
-        setCollapsed(heading, heading.dataset.mdpCollapsed !== 'true');
+        heading.dataset.mdpCollapsed = heading.dataset.mdpCollapsed === 'true' ? 'false' : 'true';
+        reconcileVisibility(document);
+      }
+
+      // MdPreview.update morphs or replaces the article without knowing
+      // about collapsed-heading state: the incoming HTML never carries the
+      // toggle button or data-mdp-collapsed, so a plain re-setup would treat
+      // every heading as freshly expanded. Snapshot by heading id (stable
+      // across a re-render of the same document) just before the swap so
+      // setup() can restore it below instead of defaulting to expanded.
+      let collapsedHeadingIDs = new Set();
+
+      function captureCollapsedState(root) {
+        collapsedHeadingIDs = new Set(
+          Array.from(root.querySelectorAll(headingSelector))
+            .filter((heading) => heading.id && heading.dataset.mdpCollapsed === 'true')
+            .map((heading) => heading.id)
+        );
       }
 
       function setup(root) {
         for (const heading of root.querySelectorAll(headingSelector)) {
           if (heading.dataset.mdpCollapseReady === 'true') continue;
           heading.dataset.mdpCollapseReady = 'true';
-          heading.dataset.mdpCollapsed = 'false';
+          heading.dataset.mdpCollapsed = collapsedHeadingIDs.has(heading.id) ? 'true' : 'false';
           heading.classList.add('mdp-collapsible-heading');
 
           const toggleButton = document.createElement('button');
           toggleButton.type = 'button';
           toggleButton.className = 'mdp-collapse-toggle';
           toggleButton.setAttribute('aria-label', `Toggle "${heading.textContent.trim()}" section`);
-          toggleButton.setAttribute('aria-expanded', 'true');
           toggleButton.addEventListener('click', () => toggle(heading));
           heading.prepend(toggleButton);
         }
+        reconcileVisibility(root);
       }
 
       window.MdPreview?.registerRenderer({
         id: 'collapsible-headings',
+        beforeUpdate: captureCollapsedState,
         render: setup
       });
       setup(document);

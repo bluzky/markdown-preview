@@ -1036,6 +1036,13 @@ nonisolated extension MarkdownHTML {
             const article = document.querySelector('.markdown-body');
             if (!article) return;
             const tStart = perfNow();
+            // Renderers get a last look at the live tree before it's morphed
+            // or replaced, so state they stashed on now-vanishing nodes (e.g.
+            // collapsed-heading flags) can be restored once the incoming
+            // content is in place and renderAll() runs setup again.
+            for (const renderer of renderers.values()) {
+                try { renderer.beforeUpdate?.(article); } catch (e) { /* one bad apple shouldn't block others */ }
+            }
             finishTableCellEdit(false);
             clearTablePartSelection();
             // DOM-diff fast path: morph the live article toward the incoming

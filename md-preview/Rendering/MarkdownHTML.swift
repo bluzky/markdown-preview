@@ -347,7 +347,11 @@ nonisolated enum MarkdownHTML {
         let containsMath = mathResult.containsMath || footnoteDefinitions.containsMath
         let containsMermaid = mermaidResult.containsMermaid || footnoteDefinitions.containsMermaid
         let containsCode = detectHighlightableCode(in: bodyHTML)
-        let extensionAssets = extensionRun.active.map { $0.assets(mode: vendorLoading) }
+        let extensionAssets = activeRenderExtensions(
+            in: bodyHTML,
+            markdown: body,
+            configuration: renderExtensionConfiguration
+        ).map { $0.assets(mode: vendorLoading) }
         let extensionCSS = extensionAssets.map(\.css)
             .filter { !$0.isEmpty }
             .joined(separator: "\n")
@@ -538,6 +542,24 @@ nonisolated enum MarkdownHTML {
         }
         result += nsHtml.substring(from: cursor)
         return result
+    }
+
+    // Heading extensions are transformed against the pre-footnote body in
+    // `render`, so a heading appearing only inside a footnote definition
+    // (footnote content is itself rendered Markdown, headings included)
+    // would never be seen there. Re-checking against the complete article —
+    // main body plus rendered footnote definitions — widens which
+    // extensions count as active without touching the transform output
+    // `render` already produced.
+    private static func activeRenderExtensions(
+        in bodyHTML: String,
+        markdown: String,
+        configuration: RenderExtensionConfiguration
+    ) -> [any MarkdownRenderExtension] {
+        renderExtensions.filter { ext in
+            configuration.isEnabled(ext.id)
+                && ext.transform(RenderContext(html: bodyHTML, markdown: markdown)).active
+        }
     }
 
 }
