@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Search for Document finds a file by part of its name.** <kbd>⇧⌘O</kbd> opens a search palette over the current project: type any part of a file name and the list narrows to the closest matches, ranked so whole-word and start-of-name hits come first, with the matched letters shown in bold. <kbd>↑</kbd> and <kbd>↓</kbd> move through the results without leaving the field. <kbd>↩</kbd> opens the result in the current tab, <kbd>⌘↩</kbd> in a new tab, and <kbd>⌥↩</kbd> in a new window. A toolbar button is available from *View → Customize Toolbar…* for anyone who would rather not use the shortcut ([#408](https://github.com/pluk-inc/markdown-preview/pull/408)).
+
 ## [0.0.61] – 2026-09-24
 
 This release adds floating formatting controls and code-block actions, improves reading and editing consistency, and fixes theme, saving, and toolbar behavior across macOS versions.
