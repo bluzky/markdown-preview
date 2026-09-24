@@ -4,6 +4,92 @@ import XCTest
 
 @MainActor
 final class EditorScrollAnchorTests: XCTestCase {
+    func testDocumentControlsFollowThemeAccentInReaderAndEditor() async throws {
+        let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
+        let source = "Introduction\n\n- Bullet\n\n1. Number\n\n[Link](https://example.com)"
+        for isEditor in [false, true] {
+            for dark in [false, true] {
+                let html = isEditor
+                    ? EditorHTML.render(markdown: source, editorJavaScript: script)
+                    : MarkdownHTML.render(markdown: source, allowsScroll: true).html
+                let harness = WebViewLayoutHarness(html: html, width: 650, isEditor: isEditor, height: 500)
+                defer { harness.close() }
+                harness.webView.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+                _ = try await harness.layout(texts: [], imageCount: 0)
+                // Exercise live changes and returning to Original, not only initial rendering.
+                for name in ["Paper", "Graphite", "Original"] {
+                    let preset = try XCTUnwrap(ThemePreset.builtIn.first { $0.name == name })
+                    let css = isEditor ? preset.setting.editorOverrideCSS
+                        : (preset.setting.markdownThemeOverrides?.css ?? "")
+                    let matches = try await harness.webView.callAsyncJavaScript("""
+                        document.getElementById(styleID).textContent = css;
+                        const link = document.querySelector(isEditor ? '.cm-md-link' : 'a');
+                        const bullet = document.querySelector(isEditor ? '.cm-md-bullet' : 'ul > li');
+                        const number = document.querySelector(isEditor ? '.cm-md-ordered' : 'ol > li');
+                        if (!link || !bullet || !number) return false;
+                        const accent = getComputedStyle(link).color;
+                        const listsMatch = getComputedStyle(bullet, isEditor ? '::after' : '::before').borderTopColor === accent
+                            && getComputedStyle(number, isEditor ? null : '::marker').color === accent;
+                        const table = document.createElement('table');
+                        table.className = isEditor ? 'cm-md-table-grid' : 'md-table-editor';
+                        const header = document.createElement('th');
+                        header.textContent = 'Header';
+                        table.createTHead().insertRow().append(header);
+                        const td = table.insertRow().insertCell();
+                        const cell = isEditor ? td.appendChild(document.createElement('div')) : td;
+                        cell.className = isEditor ? 'cm-md-table-cell' : 'is-editing';
+                        cell.contentEditable = 'true';
+                        document.body.append(table);
+                        const headerClear = getComputedStyle(header).backgroundColor === 'rgba(0, 0, 0, 0)';
+                        // This harness has no key window, so WebKit does not apply :focus.
+                        // Evaluate the actual production focus declaration through a test class.
+                        const focusStyle = document.createElement('style');
+                        if (isEditor) {
+                            const rule = [...document.styleSheets].flatMap(sheet => [...sheet.cssRules])
+                                .find(rule => rule.selectorText === '.cm-md-table-cell:focus');
+                            if (!rule) return 'missing focus rule';
+                            focusStyle.textContent = '.theme-focus-probe {' + rule.style.cssText + '}';
+                            document.head.append(focusStyle);
+                            cell.classList.add('theme-focus-probe');
+                        }
+                        const expected = document.createElement('span');
+                        expected.style.background = 'color-mix(in srgb, var(--link) 8%, transparent)';
+                        document.body.append(expected);
+                        const focusMatches = getComputedStyle(cell).outlineColor === accent
+                            && getComputedStyle(cell).backgroundColor === getComputedStyle(expected).backgroundColor;
+                        focusStyle.remove();
+                        cell.classList.remove('theme-focus-probe');
+                        cell.classList.remove('is-editing');
+                        cell.classList.add('is-table-part-selected', 'is-table-selection-top',
+                            'is-table-selection-right', 'is-table-selection-bottom', 'is-table-selection-left');
+                        expected.style.background = 'color-mix(in srgb, var(--link) 14%, Canvas)';
+                        expected.style.boxShadow = [
+                            'inset 0 1px', 'inset -1px 0', 'inset 0 -1px', 'inset 1px 0'
+                        ].map(edge => edge + ' color-mix(in srgb, var(--link) 52%, transparent)').join(',');
+                        const selectionMatches = getComputedStyle(cell).backgroundColor === getComputedStyle(expected).backgroundColor
+                            && getComputedStyle(cell).boxShadow === getComputedStyle(expected).boxShadow;
+                        let checkboxMatches = true;
+                        if (!isEditor) {
+                            const checkbox = document.createElement('input');
+                            checkbox.type = 'checkbox'; checkbox.checked = true;
+                            checkbox.className = 'task-list-item-checkbox';
+                            document.body.append(checkbox);
+                            checkboxMatches = getComputedStyle(checkbox).backgroundColor === accent
+                                && getComputedStyle(checkbox).borderTopColor === accent;
+                            checkbox.remove();
+                        }
+                        const details = JSON.stringify({listsMatch, focusMatches, selectionMatches, checkboxMatches, headerClear});
+                        table.remove(); expected.remove();
+                        return listsMatch && focusMatches && selectionMatches && checkboxMatches && headerClear ? 'pass' : details;
+                        """, arguments: ["styleID": MarkdownHTML.themeStyleElementID,
+                                           "css": css, "isEditor": isEditor],
+                        in: nil, contentWorld: .page) as? String
+                    XCTAssertEqual(matches, "pass", "\(name), dark=\(dark), editor=\(isEditor)")
+                }
+            }
+        }
+    }
+
     func testCodeCardCopyRespectsParsedIndentation() async throws {
         let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
         for (source, expected) in [("  ```\n  x\n  ```", "x"),
@@ -403,6 +489,32 @@ final class EditorScrollAnchorTests: XCTestCase {
                 in: nil, contentWorld: .page)
             XCTAssertEqual(result as? Bool, true)
         }
+    }
+
+    func testMarkdownMarkersDoNotUseCodePaletteInOriginalDarkAppearance() async throws {
+        let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
+        let editor = WebViewLayoutHarness(
+            html: EditorHTML.render(markdown: "## [Unreleased]\n\n[Real link](https://example.com)\n\n```c\n#include <stdio.h>\n```",
+                                    editorJavaScript: script),
+            width: 900, isEditor: true, height: 600)
+        defer { editor.close() }
+        editor.webView.appearance = NSAppearance(named: .darkAqua)
+        _ = try await editor.layout(texts: [], imageCount: 0)
+        let result = try await editor.webView.callAsyncJavaScript("""
+            const heading = [...document.querySelectorAll('.cm-line')]
+                .find(node => node.textContent.includes('[Unreleased]'));
+            const link = document.querySelector('.cm-md-link');
+            const metadata = [...document.querySelectorAll('.hl-meta')];
+            return {
+                markdownClean: !heading?.querySelector('.hl-meta') && !!heading,
+                linkBlue: !!link && getComputedStyle(link).color === 'rgb(65, 156, 255)',
+                codeOrange: metadata.some(node => node.textContent.includes('#include')
+                    && getComputedStyle(node).color === 'rgb(253, 143, 63)')
+            };
+            """, arguments: [:], in: nil, contentWorld: .page) as? [String: Bool]
+        XCTAssertEqual(result?["markdownClean"], true)
+        XCTAssertEqual(result?["linkBlue"], true)
+        XCTAssertEqual(result?["codeOrange"], true)
     }
 
     func testLanguageInputTextUsesPreviewHeaderInsets() async throws {
