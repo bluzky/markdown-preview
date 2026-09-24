@@ -4,6 +4,52 @@ import XCTest
 
 @MainActor
 final class EditorScrollAnchorTests: XCTestCase {
+    func testCodeCardCopyRespectsParsedIndentation() async throws {
+        let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
+        for (source, expected) in [("  ```\n  x\n  ```", "x"),
+                                   ("        x\n    y", "    x\ny"),
+                                   ("```\n\nx\n\n```", "\nx\n")] {
+            let editor = WebViewLayoutHarness(html: EditorHTML.render(markdown: source, editorJavaScript: script),
+                                              width: 650, isEditor: true, height: 400)
+            _ = try await editor.layout(texts: [], imageCount: 0)
+            let copied = try await editor.webView.callAsyncJavaScript("""
+                let copied = null;
+                Object.defineProperty(window, 'webkit', { configurable: true, value: { messageHandlers: {
+                    mdEditorHost: { postMessage: message => { if (message.kind === 'copyCode') copied = message.value; } }
+                } } });
+                document.querySelector('.cm-md-code-copy').click();
+                await Promise.resolve();
+                return copied;
+                """, arguments: [:], in: nil, contentWorld: .page) as? String
+            XCTAssertEqual(copied, expected)
+            editor.close()
+        }
+    }
+
+    func testCodeWrappingFollowsInsertionAndDoesNotSurviveDeletion() async throws {
+        let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
+        for source in ["```text\nlong code\n```", "    long code"] {
+            let editor = WebViewLayoutHarness(html: EditorHTML.render(markdown: source, editorJavaScript: script),
+                                              width: 650, isEditor: true, height: 400)
+            _ = try await editor.layout(texts: [], imageCount: 0)
+            let result = try await editor.webView.callAsyncJavaScript("""
+                const settle = async () => { for(let i=0;i<12;i++) { window.__layoutTestFrame(); await Promise.resolve(); } };
+                const wrapped = () => document.querySelector('.cm-md-code-toggle-wrap')?.getAttribute('aria-pressed');
+                document.querySelector('.cm-md-code-toggle-wrap').click();
+                await settle();
+                window.__mdEditor.insertTextAt('Before\\n\\n', 0, 0);
+                await settle();
+                const preserved = wrapped() === 'true';
+                window.__mdEditor.insertTextAt('', 0, window.__mdEditor.getMarkdown().length);
+                window.__mdEditor.insertTextAt(source, 0, 0);
+                await settle();
+                return preserved && wrapped() === 'false';
+                """, arguments: ["source": source], in: nil, contentWorld: .page) as? Bool
+            XCTAssertEqual(result, true)
+            editor.close()
+        }
+    }
+
     func testFloatingToolbarClearanceRemainsConstantAcrossZoom() async throws {
         let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
         for zoom in [0.5, 1.0, 2.0] {
@@ -58,6 +104,69 @@ final class EditorScrollAnchorTests: XCTestCase {
         XCTAssertEqual(clear as? Bool, true)
     }
 
+    func testCodeCardWrapControlsPreserveSourceAndHeaderPosition() async throws {
+        let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
+        let code = "let message = \"" + String(repeating: "long code text ", count: 30) + "\"\nprint(message)"
+        let markdown = "```swift\n" + code + "\n```"
+        for isEditor in [false, true] {
+            let html = isEditor
+                ? EditorHTML.render(markdown: markdown, editorJavaScript: script)
+                : MarkdownHTML.render(markdown: markdown, allowsScroll: true).html
+            let harness = WebViewLayoutHarness(html: html, width: 500, isEditor: isEditor, height: 600)
+            defer { harness.close() }
+            _ = try await harness.layout(texts: [], imageCount: 0)
+            let result = try await harness.webView.callAsyncJavaScript("""
+                const settle = async () => { for (let i = 0; i < 8; i++) {
+                    window.__layoutTestFrame(); await new Promise(r => setTimeout(r, 15));
+                }};
+                const toggle = () => document.querySelector(isEditor ? '.cm-md-code-toggle-wrap' : '.md-code-toggle-wrap');
+                const line = () => document.querySelector(isEditor ? '[data-code-scroll-group]' : '.md-code-wrap pre');
+                const copy = () => document.querySelector(isEditor ? '.cm-md-code-copy' : '.md-code-copy');
+                // Measure text layout independently of the native scrollport.
+                // WebKit can add/remove scrollbar space during wrap changes.
+                const contentHeight = () => {
+                    const range = document.createRange();
+                    range.selectNodeContents(isEditor ? line() : line().querySelector('code'));
+                    return range.getBoundingClientRect().height;
+                };
+                const before = isEditor ? window.__mdEditor.getMarkdown() : line().textContent;
+                let copied = null;
+                Object.defineProperty(navigator, 'clipboard', { configurable: true,
+                    value: { writeText: async text => { copied = text; } } });
+                if (isEditor) Object.defineProperty(window, 'webkit', { configurable: true,
+                    value: { messageHandlers: { mdEditorHost: { postMessage: message => {
+                        if (message.kind === 'copyCode') copied = message.value;
+                    } } } } });
+                copy().click();
+                await settle();
+                const exactCopy = copied !== null && copied.replace(/\\n$/, '') === code;
+                const height = contentHeight();
+                const buttonX = copy().getBoundingClientRect().x;
+                line().scrollLeft = 80;
+                await settle();
+                const pinned = Math.abs(copy().getBoundingClientRect().x - buttonX) < 1;
+                toggle().click();
+                await settle();
+                const wrapped = toggle().getAttribute('aria-pressed') === 'true'
+                    && contentHeight() > height + 20
+                    && line().scrollWidth <= line().clientWidth + 1;
+                toggle().click();
+                await settle();
+                return { pinned, wrapped, exactCopy,
+                    restored: Math.abs(contentHeight() - height) < 1,
+                    heights: { before: height, after: contentHeight(), scrollport: line().clientHeight },
+                    unchanged: before === (isEditor ? window.__mdEditor.getMarkdown() : line().textContent),
+                    iconOnly: copy().textContent === '' && !!copy().querySelector('svg'),
+                    unwrapped: toggle().getAttribute('aria-pressed') === 'false' };
+                """, arguments: ["isEditor": isEditor, "code": code], in: nil, contentWorld: .page)
+            let values = try XCTUnwrap(result as? [String: Any])
+            for name in ["pinned", "wrapped", "exactCopy", "restored", "unchanged", "iconOnly", "unwrapped"] {
+                XCTAssertEqual(values[name] as? Bool, true,
+                               "\(isEditor ? "Editor" : "Reader"): \(name); \(values)")
+            }
+        }
+    }
+
     func testEditorSyntaxColorsMatchPreviewTokenClassesInBothPalettes() async throws {
         let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
         let editor = WebViewLayoutHarness(
@@ -93,6 +202,37 @@ final class EditorScrollAnchorTests: XCTestCase {
                 in: nil, contentWorld: .page)
             XCTAssertEqual(result as? Bool, true)
         }
+    }
+
+    func testLanguageInputTextUsesPreviewHeaderInsets() async throws {
+        let script = try TestVendor.script("md-preview/Vendor/CodeMirror/mdedit.min.js")
+        let editor = WebViewLayoutHarness(
+            html: EditorHTML.render(markdown: "```swift\nlet value = 1\n```", editorJavaScript: script),
+            width: 900, isEditor: true, height: 400)
+        defer { editor.close() }
+        _ = try await editor.layout(texts: [], imageCount: 0)
+        let result = try await editor.webView.evaluateJavaScript("""
+            (() => {
+                const input = document.querySelector('.cm-md-code-language-input');
+                const block = input.closest('.cm-line');
+                const a = input.getBoundingClientRect(), b = block.getBoundingClientRect();
+                const s = getComputedStyle(input), bs = getComputedStyle(block);
+                return {
+                    x: a.left - b.left + parseFloat(s.paddingLeft) + parseFloat(s.borderLeftWidth) - parseFloat(bs.borderLeftWidth),
+                    y: a.top - b.top + parseFloat(s.paddingTop) + parseFloat(s.borderTopWidth) - parseFloat(bs.borderTopWidth),
+                    font: parseFloat(s.fontSize), line: parseFloat(s.lineHeight),
+                    width: a.width,
+                    actionGap: block.querySelector('.cm-md-code-toggle-wrap').getBoundingClientRect().left - a.right
+                };
+            })()
+            """)
+        let values = try XCTUnwrap(result as? [String: Double])
+        XCTAssertEqual(try XCTUnwrap(values["x"]), 16, accuracy: 0.1)
+        XCTAssertEqual(try XCTUnwrap(values["y"]), 15, accuracy: 0.1)
+        XCTAssertEqual(values["font"], 11)
+        XCTAssertEqual(values["line"], 14)
+        XCTAssertEqual(try XCTUnwrap(values["width"]), 154, accuracy: 0.1)
+        XCTAssertGreaterThan(try XCTUnwrap(values["actionGap"]), 100)
     }
 
     func testTableInlineCodeRendersAndPreservesMarkdownWhileEditing() async throws {
