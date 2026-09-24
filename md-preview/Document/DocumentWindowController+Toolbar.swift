@@ -143,20 +143,21 @@ extension DocumentWindowController {
         }
     }
 
-    /// Back and forward as an AppKit-owned group rather than an
-    /// `NSSegmentedControl` in a custom view. A toolbar only keeps window-drag
-    /// regions around items it draws itself, so hosting a control here is what
-    /// cost the toolbar its drag surface in the first place.
+    /// The system's paired navigation control: an `NSToolbarItemGroup` built
+    /// by the segmented convenience constructor, which is what draws the
+    /// divider between the chevrons. `labels` stays nil — a non-nil labels
+    /// array reserves per-segment label width and is what made the pair wider
+    /// than the system's own back/forward.
     private func makeNavigationItem(willBeInsertedIntoToolbar: Bool) -> NSToolbarItem {
         let back = NSLocalizedString("Back", comment: "Navigation toolbar back button")
         let forward = NSLocalizedString("Forward", comment: "Navigation toolbar forward button")
-        let backImage = NSImage(systemSymbolName: "chevron.left", accessibilityDescription: back) ?? NSImage()
-        let forwardImage = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: forward) ?? NSImage()
+        let backImage = NSImage(systemSymbolName: "chevron.backward", accessibilityDescription: back) ?? NSImage()
+        let forwardImage = NSImage(systemSymbolName: "chevron.forward", accessibilityDescription: forward) ?? NSImage()
 
         let item = NSToolbarItemGroup(itemIdentifier: .navigation,
                                       images: [backImage, forwardImage],
                                       selectionMode: .momentary,
-                                      labels: [back, forward],
+                                      labels: nil,
                                       target: self,
                                       action: #selector(navigateHistory(_:)))
         item.label = NSLocalizedString("Navigation", comment: "Navigation toolbar item label")
