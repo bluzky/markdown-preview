@@ -130,6 +130,32 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
         webView.evaluateJavaScript(script) { _, _ in }
     }
 
+    /// Restyles an open editor after a font, reader-layout or alignment
+    /// change in Settings, the way the preview page is restyled in place.
+    func applyReaderStyle() {
+        webView.evaluateJavaScript(
+            ReaderLayoutSetting.styleUpdateScript(css: Self.readerStyleCSS())
+        ) { _, _ in }
+    }
+
+    /// Switches editor modules on or off in an open editor after an
+    /// extension toggle in Settings. Fresh loads embed the same state in
+    /// `editorHTML`.
+    func applyExtensionState() {
+        let state = MarkdownHTML.editorExtensionState(
+            configuration: RenderExtensionPreferences.currentConfiguration
+        )
+        webView.evaluateJavaScript(
+            "window.__mdEditor && window.__mdEditor.setExtensionState(\(EditorHTML.extensionStateLiteral(state)))"
+        ) { _, _ in }
+    }
+
+    private static func readerStyleCSS() -> String {
+        EditorHTML.readerStyleCSS(documentFont: .current,
+                                  readerLayout: .current,
+                                  textAlignment: .current)
+    }
+
     override func viewDidLayout() {
         super.viewDidLayout()
         updateObscuredContentInsets()
@@ -541,8 +567,13 @@ final class EditorViewController: NSViewController, WKNavigationDelegate {
                 lightPageBackground: lightPageBackground,
                 darkPageBackground: darkPageBackground,
                 themeOverrideCSS: colors.editorOverrideCSS,
+                readerStyleCSS: readerStyleCSS(),
                 usesPageScrolling: usesPageScrolling,
-                bridgeName: EditorBridge.name
+                bridgeName: EditorBridge.name,
+                extensionState: MarkdownHTML.editorExtensionState(
+                    configuration: RenderExtensionPreferences.currentConfiguration
+                ),
+                extensionCSS: MarkdownHTML.editorExtensionCSS()
             )
         )
     }

@@ -33,8 +33,6 @@ nonisolated extension MarkdownHTML {
 
     struct FootnoteDefinitionRenderResult {
         let html: String
-        let containsMath: Bool
-        let containsMermaid: Bool
     }
 
     private static let footnoteDefinitionRegex: NSRegularExpression = {
@@ -233,27 +231,30 @@ nonisolated extension MarkdownHTML {
     static func renderFootnoteDefinitions(
         _ footnotes: FootnoteExtraction,
         sourceLineOffset: Int,
-        strictLineBreaks: Bool
+        strictLineBreaks: Bool,
+        rendersMath: Bool = true,
+        highlightsCode: Bool = true,
+        rendersHighlights: Bool = true,
+        rendersCallouts: Bool = true
     ) -> FootnoteDefinitionRenderResult {
         guard !footnotes.definitions.isEmpty else {
             return FootnoteDefinitionRenderResult(
-                html: "",
-                containsMath: false,
-                containsMermaid: false
+                html: ""
             )
         }
 
-        var containsMath = false
-        var containsMermaid = false
         let referencesByNumber = Dictionary(grouping: footnotes.references, by: { $0.number })
         let items = footnotes.definitions.map { definition -> String in
             let renderedContent = renderFootnoteDefinitionContent(
                 definition.content,
                 sourceLineOffset: sourceLineOffset + definition.sourceLine - 1,
-                strictLineBreaks: strictLineBreaks
+                strictLineBreaks: strictLineBreaks,
+                rendersMath: rendersMath,
+                highlightsCode: highlightsCode,
+                rendersHighlights: rendersHighlights,
+                rendersCallouts: rendersCallouts
             )
-            containsMath = containsMath || renderedContent.containsMath
-            containsMermaid = containsMermaid || renderedContent.containsMermaid
+
             let backrefs = (referencesByNumber[definition.number] ?? []).map { reference in
                 let accessibilityLabel = htmlEscape(String(
                     format: NSLocalizedString(
@@ -284,9 +285,7 @@ nonisolated extension MarkdownHTML {
             \(items)
             </ol>
             </section>
-            """,
-            containsMath: containsMath,
-            containsMermaid: containsMermaid
+            """
         )
     }
 
@@ -304,20 +303,32 @@ nonisolated extension MarkdownHTML {
     private static func renderFootnoteDefinitionContent(
         _ markdown: String,
         sourceLineOffset: Int,
-        strictLineBreaks: Bool
+        strictLineBreaks: Bool,
+        rendersMath: Bool,
+        highlightsCode: Bool,
+        rendersHighlights: Bool,
+        rendersCallouts: Bool
     ) -> FootnoteDefinitionRenderResult {
-        let math = extractMath(from: markdown.trimmingCharacters(in: .whitespacesAndNewlines))
+        let source = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        let math = rendersMath
+            ? extractMath(from: source)
+            : MathExtraction(
+                processedMarkdown: source,
+                blocks: [],
+                blockLineCounts: [],
+                inlines: []
+            )
         let formatted = EscapingHTMLFormatter.format(
             math.processedMarkdown,
             sourceLineOffset: sourceLineOffset,
+            highlightsCode: highlightsCode,
+            rendersHighlights: rendersHighlights,
+            rendersCallouts: rendersCallouts,
             strictLineBreaks: strictLineBreaks
         )
-        let mermaidResult = renderMermaidBlocks(in: formatted)
-        let mathResult = renderMathBlocks(in: mermaidResult.html, with: math)
+        let mathHTML = rendersMath ? renderMathBlocks(in: formatted, with: math) : formatted
         return FootnoteDefinitionRenderResult(
-            html: mathResult.html,
-            containsMath: mathResult.containsMath,
-            containsMermaid: mermaidResult.containsMermaid
+            html: mathHTML
         )
     }
 

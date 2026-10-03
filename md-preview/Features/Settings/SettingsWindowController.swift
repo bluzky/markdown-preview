@@ -17,6 +17,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     case general = "General"
     case reading = "Reading"
     case theme = "Appearance"
+    case renderExtensions = "Extensions"
     case privacy = "Privacy"
     case about = "About"
 
@@ -27,11 +28,11 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     /// Development-time exports of the icons rendered by each registered
     /// System Settings extension. They are bundled so the sandboxed app never
     /// needs to call private IconServices at runtime. Panes without an export
-    /// (Reading and Appearance) draw an equivalent tile in SwiftUI instead.
+    /// (Reading, Appearance and Extensions) draw an equivalent tile in SwiftUI instead.
     var iconAssetName: String? {
         switch self {
         case .general: "SettingsGeneral"
-        case .reading, .theme: nil
+        case .reading, .theme, .renderExtensions: nil
         case .privacy: "SettingsPrivacy"
         case .about: "SettingsAbout"
         }
@@ -52,8 +53,10 @@ struct SettingsPaneIcon: View {
                     .resizable()
                     .interpolation(.high)
                     .frame(width: 24, height: 24)
-            } else {
+            } else if pane == .reading || pane == .theme {
                 generatedTile
+            } else {
+                extensionTile
                     .frame(width: 24, height: 24)
             }
         }
@@ -377,6 +380,7 @@ struct SettingsDetailView: View {
         case .general: GeneralSettingsView()
         case .reading: ReadingSettingsView()
         case .theme: ThemeSettingsView()
+        case .renderExtensions: RenderExtensionsSettingsView()
         case .privacy: PrivacySettingsView()
         case .about: AboutSettingsView()
         }

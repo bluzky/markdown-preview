@@ -120,6 +120,191 @@ final class MdPreviewUpdateTests: XCTestCase {
         XCTAssertFalse(state.detailsOpen, json)
     }
 
+    /// The incoming HTML for an update never carries the collapse toggle
+    /// button or `data-mdp-collapsed` (client JS adds those), so morphing or
+    /// swapping the article would otherwise silently re-expand every
+    /// heading. The collapsible-headings extension's `beforeUpdate` hook
+    /// must snapshot collapsed state off the live tree and `setup()` must
+    /// restore it, rather than defaulting every re-processed heading to
+    /// expanded.
+    @MainActor
+    func testMorphdomUpdatePreservesCollapsedHeadingState() async throws {
+        let webView = try await loadHarness(
+            articleAttributes: "",
+            extraHeadScripts: MarkdownHTML.collapsibleHeadersScript
+        )
+
+        func articleHTML(paragraph: String) -> String {
+            MarkdownHTML.render(
+                markdown: "# Heading\n\n\(paragraph)",
+                vendorLoading: .lazy
+            ).articleHTML
+        }
+        let docV1 = MarkdownHTML.javaScriptStringLiteral(articleHTML(paragraph: "First draft."))
+        let docV2 = MarkdownHTML.javaScriptStringLiteral(articleHTML(paragraph: "Edited draft."))
+
+        _ = try await webView.evaluateJavaScript("window.MdPreview.update(\(docV1)); true")
+        _ = try await webView.evaluateJavaScript("""
+            document.querySelector('h1').querySelector('.mdp-collapse-toggle').click(); true
+            """)
+        let collapsedBeforeUpdate = try await webView.evaluateJavaScript(
+            "document.querySelector('p').classList.contains('mdp-collapsed-section')"
+        ) as? Bool
+        XCTAssertEqual(collapsedBeforeUpdate, true)
+
+        _ = try await webView.evaluateJavaScript("window.MdPreview.update(\(docV2)); true")
+
+        let result = try await webView.evaluateJavaScript("""
+            (() => {
+                const heading = document.querySelector('h1');
+                return {
+                    paragraphText: document.querySelector('p').textContent,
+                    stillCollapsed: document.querySelector('p').classList.contains('mdp-collapsed-section'),
+                    ariaExpanded: heading.querySelector('.mdp-collapse-toggle').getAttribute('aria-expanded'),
+                    toggleCount: heading.querySelectorAll('.mdp-collapse-toggle').length,
+                    toggleOwned: heading.querySelector('.mdp-collapse-toggle')?.dataset.mdpExt
+                };
+            })()
+            """) as? [String: Any]
+        XCTAssertEqual(result?["paragraphText"] as? String, "Edited draft.")
+        XCTAssertEqual(result?["stillCollapsed"] as? Bool, true)
+        XCTAssertEqual(result?["ariaExpanded"] as? String, "false")
+        XCTAssertEqual(result?["toggleCount"] as? Int, 1)
+        XCTAssertEqual(result?["toggleOwned"] as? String, "collapsible-headings")
+    }
+
+    /// Heading ids are positional (`md-heading-N`), so inserting a heading
+    /// above a collapsed one shifts every later id. Collapse state must follow
+    /// the heading's content, not its index.
+    @MainActor
+    func testCollapsedHeadingStateSurvivesEarlierHeadingInsertion() async throws {
+        let webView = try await loadHarness(
+            articleAttributes: "",
+            extraHeadScripts: MarkdownHTML.collapsibleHeadersScript
+        )
+
+        func articleHTML(_ markdown: String) -> String {
+            MarkdownHTML.javaScriptStringLiteral(
+                MarkdownHTML.render(markdown: markdown, vendorLoading: .lazy).articleHTML
+            )
+        }
+        let before = articleHTML("# A\n\nalpha\n\n# B\n\nbeta\n\n# C\n\ngamma")
+        let after = articleHTML("# New\n\nfresh\n\n# A\n\nalpha\n\n# B\n\nbeta\n\n# C\n\ngamma")
+
+        _ = try await webView.evaluateJavaScript("window.MdPreview.update(\(before)); true")
+        _ = try await webView.evaluateJavaScript("""
+            document.querySelectorAll('h1')[2].querySelector('.mdp-collapse-toggle').click(); true
+            """)
+        _ = try await webView.evaluateJavaScript("window.MdPreview.update(\(after)); true")
+
+        let result = try await webView.evaluateJavaScript("""
+            (() => {
+                const hidden = {};
+                document.querySelectorAll('.markdown-body > p').forEach((p) => {
+                    hidden[p.textContent] = p.classList.contains('mdp-collapsed-section');
+                });
+                return hidden;
+            })()
+            """) as? [String: Bool]
+        XCTAssertEqual(result, ["fresh": false, "alpha": false, "beta": false, "gamma": true])
+    }
+
+    /// Collapsed sections are display:none, so find's selected `<mark>` would
+    /// measure as zero-size. `reveal` must expand its collapsed ancestors.
+    @MainActor
+    func testRevealExpandsCollapsedAncestors() async throws {
+        let webView = try await loadHarness(
+            articleAttributes: "",
+            extraHeadScripts: MarkdownHTML.collapsibleHeadersScript
+        )
+        let doc = MarkdownHTML.javaScriptStringLiteral(
+            MarkdownHTML.render(
+                markdown: "# Top\n\n## Nested\n\ninner text\n\n# Other\n\nouter text",
+                vendorLoading: .lazy
+            ).articleHTML
+        )
+        _ = try await webView.evaluateJavaScript("window.MdPreview.update(\(doc)); true")
+
+        let result = try await webView.evaluateJavaScript("""
+            (() => {
+                document.querySelector('h1').querySelector('.mdp-collapse-toggle').click();
+                const h2 = document.querySelector('h2');
+                const p = document.querySelector('p');
+                const match = document.createElement('mark');
+                match.textContent = 'inner';
+                p.appendChild(match);
+                const hiddenBefore = h2.classList.contains('mdp-collapsed-section')
+                    && p.classList.contains('mdp-collapsed-section');
+                window.MdPreview.reveal(match);
+                return {
+                    hiddenBefore,
+                    visibleAfter: !h2.classList.contains('mdp-collapsed-section'),
+                    contentVisible: !p.classList.contains('mdp-collapsed-section')
+                };
+            })()
+            """) as? [String: Bool]
+        XCTAssertEqual(result, ["hiddenBefore": true, "visibleAfter": true, "contentVisible": true])
+    }
+
+    @MainActor
+    func testExtensionLifecycleIsOrderedIsolatedAndDocumentScoped() async throws {
+        let webView = try await loadHarness(articleAttributes: "")
+        let first = MarkdownHTML.javaScriptStringLiteral("<p>First</p>")
+        let second = MarkdownHTML.javaScriptStringLiteral("<p>Second</p>")
+        let third = MarkdownHTML.javaScriptStringLiteral("<p>Third</p>")
+
+        let result = try await webView.evaluateJavaScript("""
+            (() => {
+                const events = [];
+                window.MdPreview.registerExtension({
+                    id: 'broken',
+                    setup() { throw new Error('setup'); },
+                    beforeUpdate() { throw new Error('beforeUpdate'); },
+                    render() { throw new Error('render'); },
+                    reveal() { throw new Error('reveal'); },
+                    onThemeChange() { throw new Error('theme'); }
+                });
+                window.MdPreview.registerExtension({
+                    id: 'stateful',
+                    setup(host) { events.push('setup:' + host.documentID); },
+                    beforeUpdate(root, host) {
+                        events.push('before:' + host.documentID);
+                        return { token: root.dataset.token || null };
+                    },
+                    render(root, context) {
+                        events.push('render:' + context.reason + ':'
+                            + (context.snapshot?.token || 'none') + ':' + context.host.documentID);
+                    },
+                    reveal(el) { events.push('reveal'); return el.id === 'target'; },
+                    onThemeChange(theme, host) { events.push('theme:' + theme.name + ':' + host.theme.name); }
+                });
+                const duplicate = window.MdPreview.registerExtension({ id: 'stateful' });
+                window.MdPreview.update(\(first), { documentID: 'one' });
+                document.querySelector('.markdown-body').dataset.token = 'keep';
+                window.MdPreview.update(\(second), { documentID: 'one' });
+                document.querySelector('.markdown-body').dataset.token = 'drop';
+                window.MdPreview.update(\(third), { documentID: 'two' });
+                const target = document.createElement('span');
+                target.id = 'target';
+                document.querySelector('.markdown-body').appendChild(target);
+                const revealed = window.MdPreview.reveal(target);
+                window.MdPreview.setTheme({ name: 'dark' });
+                return JSON.stringify({ events, duplicate, revealed });
+            })()
+            """)
+        let json = try XCTUnwrap(result as? String)
+        let state = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        let events = try XCTUnwrap(state?["events"] as? [String])
+
+        XCTAssertFalse(state?["duplicate"] as? Bool ?? true)
+        XCTAssertTrue(state?["revealed"] as? Bool ?? false)
+        XCTAssertEqual(events.first, "setup:page")
+        XCTAssertTrue(events.contains("render:update:keep:one"), json)
+        XCTAssertTrue(events.contains("render:update:none:two"), json)
+        XCTAssertTrue(events.contains("reveal"), json)
+        XCTAssertTrue(events.contains("theme:dark:dark"), json)
+    }
+
     @MainActor
     func testWarmupArticleTakesInnerHTMLReplaceBeforeMorphing() async throws {
         let webView = try await loadHarness(
@@ -395,7 +580,8 @@ final class MdPreviewUpdateTests: XCTestCase {
     @MainActor
     private func loadHarness(
         articleAttributes: String,
-        stubsWebKitMessageHandler: Bool = false
+        stubsWebKitMessageHandler: Bool = false,
+        extraHeadScripts: String = ""
     ) async throws -> WKWebView {
         let purifyJS = try TestVendor.script("md-preview/Vendor/DOMPurify/purify.min.js")
         let morphdomJS = try TestVendor.script("md-preview/Vendor/Morphdom/morphdom.min.js")
@@ -413,19 +599,23 @@ final class MdPreviewUpdateTests: XCTestCase {
         let fakeRenderers = """
         <script>
         (() => {
-            function renderFake() {
+            function renderMath() {
                 document.querySelectorAll('.math:not([data-math-done="1"])').forEach((el) => {
                     el.__mdSrc = el.textContent;
                     el.dataset.mathDone = '1';
                     el.__renderCount = (el.__renderCount || 0) + 1;
                     el.innerHTML = '<span class="fake-katex">rendered-math</span>';
                 });
+            }
+            function renderMermaid() {
                 document.querySelectorAll('.mermaid-figure .mermaid:not([data-mm-done="1"])').forEach((el) => {
                     el.__mdSrc = el.textContent;
                     el.dataset.mmDone = '1';
                     el.__renderCount = (el.__renderCount || 0) + 1;
                     el.innerHTML = '<svg class="fake-mermaid"></svg>';
                 });
+            }
+            function renderCode() {
                 document.querySelectorAll('pre code[class*="language-"]:not([data-hljs-done="1"])').forEach((el) => {
                     el.__mdSrc = el.textContent;
                     el.dataset.hljsDone = '1';
@@ -433,7 +623,18 @@ final class MdPreviewUpdateTests: XCTestCase {
                     el.innerHTML = '<span class="fake-hljs">highlighted</span>';
                 });
             }
-            window.MdPreview.registerReapplier(renderFake);
+            window.MdPreview.registerExtension({
+                id: 'fake-math', render: renderMath,
+                expensiveBlock: { cls: 'math', kind: 'math', inner: null, done: 'mathDone', attrInner: null }
+            });
+            window.MdPreview.registerExtension({
+                id: 'fake-mermaid', render: renderMermaid,
+                expensiveBlock: { cls: 'mermaid-figure', kind: 'mm', inner: '.mermaid', done: 'mmDone', attrInner: null }
+            });
+            window.MdPreview.registerExtension({
+                id: 'fake-code', render: renderCode,
+                expensiveBlock: { cls: 'md-code-wrap', kind: 'code', inner: 'pre > code', done: 'hljsDone', attrInner: 'pre' }
+            });
         })();
         </script>
         """
@@ -447,6 +648,7 @@ final class MdPreviewUpdateTests: XCTestCase {
         \(webKitMessageHandlerStub)
         \(MarkdownHTML.hostBridgeScript)
         \(fakeRenderers)
+        \(extraHeadScripts)
         </head><body>
         <article class="markdown-body"\(articleAttributes)></article>
         </body></html>

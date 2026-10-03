@@ -473,21 +473,21 @@ nonisolated extension MarkdownHTML {
                     document.head.appendChild(s);
                 });
             },
-            // Wires up a renderer whose vendor JS is loaded after first paint.
-            // - registers a reapplier that gates on `loaded`, so fast-path
-            //   updates don't fire the renderer before its bundle has arrived
-            // - on first paint, fetches `src` (and any `extras` after) and
-            //   calls `run`
-            lazyRenderer({ src, extras, run }) {
+            // Registers a lifecycle extension before its vendor bundle loads.
+            // Its render hook gates until first paint has fetched `src`; once
+            // ready, reapplyExtensions routes the first run through same
+            // lifecycle path as every later body swap.
+            lazyExtension({ id, src, extras, render }) {
                 let loaded = false;
-                if (window.MdPreview && window.MdPreview.registerReapplier) {
-                    window.MdPreview.registerReapplier(() => { if (loaded) run(); });
-                }
+                window.MdPreview?.registerExtension({
+                    id,
+                    render(root, context) { if (loaded) render(root, context); }
+                });
                 this.afterPaint(async () => {
                     try {
                         await this.loadScript(src);
                         loaded = true;
-                        run();
+                        window.MdPreview?.reapplyExtensions();
                         if (extras) {
                             for (const e of extras) this.loadScript(e).catch(() => {});
                         }
@@ -545,16 +545,121 @@ nonisolated extension MarkdownHTML {
             return DOMPurify.sanitize(html, SANITIZE_CONFIG);
         }
 
-        // Incremental-update entry point. Each renderer (KaTeX/Mermaid)
-        // registers an idempotent reapplier that re-processes the current
-        // article. Same-flag re-renders skip the WKWebView reload entirely.
-        const reappliers = [];
+        // Incremental-update entry point. Extensions register independently;
+        // core owns ordering, state handoff, DOM-diff preservation, and theme
+        // delivery. Map insertion order is registration order.
+        const extensions = new Map();
+        const extensionSnapshots = new Map();
+        const hostState = { documentID: 'page', theme: null };
+        let hasRenderedArticle = false;
+        let legacyReapplierID = 0;
+        const extensionHost = {};
+        Object.defineProperties(extensionHost, {
+            article: { get: () => document.querySelector('.markdown-body') },
+            documentID: { get: () => hostState.documentID },
+            theme: { get: () => hostState.theme },
+            pushHeight: { value: pushHeight },
+            perfLog: { value: perfLog }
+        });
+        Object.freeze(extensionHost);
         window.MdPreview = window.MdPreview || {};
-        window.MdPreview.registerReapplier = (fn) => {
-            if (typeof fn === 'function') reappliers.push(fn);
+
+        function extensionFailure(extension, hook, error) {
+            try {
+                console.error('[md-preview] extension "' + extension.id
+                    + '" ' + hook + ' failed:', error);
+            } catch (e) {}
+        }
+        function callExtension(extension, hook, ...args) {
+            if (typeof extension[hook] !== 'function') return undefined;
+            try {
+                return extension[hook](...args);
+            } catch (error) {
+                extensionFailure(extension, hook, error);
+                return undefined;
+            }
+        }
+        function renderExtensions(root, reason) {
+            for (const extension of extensions.values()) {
+                // Consume before rendering so no extension can observe its
+                // snapshot twice, including when its render hook throws.
+                const snapshot = extensionSnapshots.get(extension.id);
+                extensionSnapshots.delete(extension.id);
+                callExtension(extension, 'render', root, {
+                    host: extensionHost, reason, snapshot
+                });
+            }
+            extensionSnapshots.clear();
+        }
+        window.MdPreview.reapplyExtensions = () => {
+            const article = extensionHost.article;
+            if (article) renderExtensions(article, 'reapply');
         };
-        function enableTaskCheckboxes() {
-            document.querySelectorAll('.task-list-item-checkbox').forEach(box => {
+        function captureExtensionSnapshots(root) {
+            for (const extension of extensions.values()) {
+                const snapshot = callExtension(extension, 'beforeUpdate', root, extensionHost);
+                if (snapshot !== undefined) extensionSnapshots.set(extension.id, snapshot);
+                else extensionSnapshots.delete(extension.id);
+            }
+        }
+        window.MdPreview.registerExtension = (extension) => {
+            if (!extension || typeof extension.id !== 'string' || !extension.id) {
+                try { console.error('[md-preview] extension requires a non-empty id.'); } catch (e) {}
+                return false;
+            }
+            if (extensions.has(extension.id)) {
+                try { console.error('[md-preview] duplicate extension id: ' + extension.id); } catch (e) {}
+                return false;
+            }
+            extensions.set(extension.id, extension);
+            callExtension(extension, 'setup', extensionHost);
+            // Inline documents can populate before their body-end extension
+            // assets run. Catch that extension up without re-running others.
+            const article = extensionHost.article;
+            if (hasRenderedArticle && article) {
+                callExtension(extension, 'render', article, {
+                    host: extensionHost, reason: 'reapply', snapshot: undefined
+                });
+            }
+            return true;
+        };
+        // Compatibility for out-of-tree callers. Every shim becomes an
+        // ordered render-only extension with same failure isolation.
+        window.MdPreview.registerReapplier = (fn) => {
+            if (typeof fn !== 'function') return false;
+            legacyReapplierID += 1;
+            return window.MdPreview.registerExtension({
+                id: 'legacy-reapplier-' + legacyReapplierID,
+                render(root) { fn(root); }
+            });
+        };
+        window.MdPreview.reveal = (el) => {
+            let changed = false;
+            for (const extension of extensions.values()) {
+                changed = callExtension(extension, 'reveal', el, extensionHost) === true || changed;
+            }
+            if (changed) pushHeight();
+            return changed;
+        };
+        // Keep current native callers working until they move to reveal().
+        window.MdPreview.revealElement = (el) => window.MdPreview.reveal(el);
+        function deliverTheme(theme) {
+            hostState.theme = theme;
+            for (const extension of extensions.values()) {
+                callExtension(extension, 'onThemeChange', theme, extensionHost);
+            }
+        }
+        window.MdPreview.setTheme = deliverTheme;
+        window.MdPreview.notifyThemeChange = deliverTheme;
+        window.MdPreview.disposeExtensions = () => {
+            for (const extension of extensions.values()) {
+                callExtension(extension, 'dispose', extensionHost);
+            }
+            extensions.clear();
+            extensionSnapshots.clear();
+        };
+        function enableTaskCheckboxes(root) {
+            root.querySelectorAll('.task-list-item-checkbox').forEach(box => {
                 box.disabled = !hasHostBridge;
             });
         }
@@ -566,7 +671,10 @@ nonisolated extension MarkdownHTML {
             if (!Number.isInteger(line) || line < 1) return;
             post({ kind: 'taskCheckbox', line, checked: box.checked });
         });
-        reappliers.push(enableTaskCheckboxes);
+        window.MdPreview.registerExtension({
+            id: 'task-checkboxes',
+            render: enableTaskCheckboxes
+        });
         function mdHash(s) {
             let h = 5381;
             for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
@@ -584,7 +692,10 @@ nonisolated extension MarkdownHTML {
             { cls: 'md-code-wrap',   kind: 'code', inner: 'pre > code', done: 'hljsDone', attrInner: 'pre' },
             { cls: 'math',           kind: 'math', inner: null,         done: 'mathDone', attrInner: null  }
         ];
-        const EXPENSIVE_SELECTOR = EXPENSIVE_BLOCKS.map((b) => '.' + b.cls).join(', ');
+
+        function expensiveSelector() {
+            return EXPENSIVE_BLOCKS.map((b) => '.' + b.cls).join(', ');
+        }
         function expensiveKindOf(el) {
             if (!el.classList) return null;
             return EXPENSIVE_BLOCKS.find((b) => el.classList.contains(b.cls)) || null;
@@ -600,7 +711,9 @@ nonisolated extension MarkdownHTML {
         // both strings, so identical source yields identical keys.
         function keyExpensiveBlocks(root) {
             const counts = new Map();
-            root.querySelectorAll(EXPENSIVE_SELECTOR).forEach((el) => {
+            const selector = expensiveSelector();
+            if (!selector) return;
+            root.querySelectorAll(selector).forEach((el) => {
                 const info = expensiveKindOf(el);
                 const srcNode = expensiveSrcNode(el, info);
                 if (!srcNode) return;
@@ -670,7 +783,11 @@ nonisolated extension MarkdownHTML {
                 }
                 if (fromEl.tagName === 'DETAILS') toEl.toggleAttribute('open', fromEl.open);
                 return true;
-            }
+            },
+            // Extension controls are not source DOM. Keep them through a
+            // morph, then let their owning render hook reconcile state.
+            onBeforeNodeDiscarded: (node) => !(node.nodeType === 1
+                && node.hasAttribute('data-mdp-ext'))
         };
 
         // `opts.keepHidden` preserves the warmup opacity so the synthetic
@@ -696,6 +813,17 @@ nonisolated extension MarkdownHTML {
             const article = document.querySelector('.markdown-body');
             if (!article) return;
             const tStart = perfNow();
+            const nextDocumentID = opts && typeof opts.documentID === 'string'
+                ? opts.documentID : hostState.documentID;
+            const documentChanged = nextDocumentID !== hostState.documentID;
+            if (documentChanged) {
+                hostState.documentID = nextDocumentID;
+                extensionSnapshots.clear();
+            }
+            const reason = hasRenderedArticle ? 'update' : 'initial';
+            // Capture each extension's live state synchronously before DOM
+            // replacement. Core retains and delivers only its own snapshot.
+            if (!documentChanged) captureExtensionSnapshots(article);
             // DOM-diff fast path: morph the live article toward the incoming
             // HTML so finished Mermaid SVGs, KaTeX output, and highlighted
             // code survive the update instead of being re-rendered. Skipped
@@ -735,16 +863,13 @@ nonisolated extension MarkdownHTML {
                 // every update after it may morph.
                 delete article.dataset.warmup;
             }
-            if (articleHTML) {
+            if (articleHTML && !morphed) {
                 // The morph path already decorated the incoming tree; only
                 // the innerHTML swap leaves fresh undecorated nodes behind.
-                if (!morphed) {
-                    decorateCodeBlocks();
-                }
-                for (const fn of reappliers) {
-                    try { fn(); } catch (e) { /* one bad apple shouldn't block others */ }
-                }
+                decorateCodeBlocks();
             }
+            renderExtensions(article, reason);
+            hasRenderedArticle = true;
             perfLog('MdPreview.update' + (morphed ? ' (morphdom)' : ''), '(+' + (perfNow() - tStart).toFixed(1) + 'ms)');
             pushHeight();
         };
@@ -758,7 +883,10 @@ nonisolated extension MarkdownHTML {
             if (!tmpl) return;
             const article = document.querySelector('.markdown-body');
             const keepHidden = !!(article && article.dataset.warmup === '1');
-            window.MdPreview.update(tmpl.innerHTML, { keepHidden });
+            window.MdPreview.update(tmpl.innerHTML, {
+                keepHidden,
+                documentID: window.MdPreview.documentID
+            });
             tmpl.remove();
         }
         // Body-end hook: inline-mode documents call this right after the

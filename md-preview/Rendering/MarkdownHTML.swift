@@ -11,11 +11,11 @@ import Markdown
 // the main actor. This lets MarkdownWebView.display dispatch the render
 // to a concurrent task instead of stalling the main thread on large docs.
 nonisolated enum MarkdownHTML {
-    /// How the heavy KaTeX/Mermaid bundles are delivered.
+    /// How heavy Highlight, KaTeX, and Mermaid bundles are delivered.
     /// - inline: bundles are embedded as `<script>…</script>` blocks in the
     ///   HTML. Self-contained, used by Quick Look (which delivers HTML as a
-    ///   single QLPreviewReply payload). The heavy scripts sit at body-end
-    ///   behind an early populate call (see `VendorEmission`) so document
+    ///   single QLPreviewReply payload). Active heavy scripts sit at body-end
+    ///   behind an early populate call so document
     ///   text paints before the bundles parse.
     /// - lazy: only small init stubs are inline; the heavy vendor JS is
     ///   fetched via `md-asset:///__vendor/<file>` after first paint, so the
@@ -25,18 +25,6 @@ nonisolated enum MarkdownHTML {
         case lazy
     }
 
-    /// A vendor renderer's contribution to the document, split by insertion
-    /// point. In `.inline` mode only the CSS stays in `head` (so layout is
-    /// stable from the first paint — no FOUC when the renderer decorates the
-    /// article later) while the multi-megabyte `<script>` bundles move to
-    /// `body`, after the article and an early populate call. That lets the
-    /// parser paint the document text before it grinds through the vendor
-    /// JS — `.inline`'s answer to `.lazy`'s deferred fetch. `.lazy` emissions
-    /// keep everything in `head`, byte-identical to the pre-split output.
-    struct VendorEmission {
-        var head: String = ""
-        var body: String = ""
-    }
 
     /// Layout of the rendered article column.
     /// - centered: capped at `contentColumnWidth` and centered by CSS auto
@@ -260,9 +248,19 @@ nonisolated enum MarkdownHTML {
         /// The Markdown the article was rendered from; the page keeps it for
         /// copy-as-source and body swaps pass it along with the article.
         let markdown: String
-        let containsMath: Bool
-        let containsMermaid: Bool
-        let containsCode: Bool
+        /// Script capabilities and active extension ids loaded by this page.
+        /// A host may body-swap only when next document's set is a subset.
+        /// Extension CSS is separate: warmup includes every enabled CSS asset.
+        let scriptAssetIDs: Set<String>
+
+        /// Convenience checks retained for renderer-output tests. Hosts make
+        /// fast-path decisions from `scriptAssetIDs` directly.
+        var containsMath: Bool { scriptAssetIDs.contains("math") }
+        var containsMermaid: Bool { scriptAssetIDs.contains("mermaid") }
+        var containsCode: Bool { scriptAssetIDs.contains("code") }
+        var activeExtensionIDs: Set<String> {
+            scriptAssetIDs.intersection(Set(renderExtensions.map(\.id)))
+        }
     }
 
     static func makeHTML(from markdown: String,
@@ -273,7 +271,9 @@ nonisolated enum MarkdownHTML {
                          documentFont: DocumentFontSetting = .current,
                          readerLayout: ReaderLayoutSetting = .current,
                          strictLineBreaks: Bool = StrictLineBreaksSetting.current,
-                         textAlignment: TextAlignmentSetting = .current) -> String {
+                         textAlignment: TextAlignmentSetting = .current,
+                         documentID: String = "page",
+                         renderExtensionConfiguration: RenderExtensionConfiguration = .allEnabled) -> String {
         render(markdown: markdown,
                allowsScroll: allowsScroll,
                assetBaseHref: assetBaseHref,
@@ -282,7 +282,9 @@ nonisolated enum MarkdownHTML {
                documentFont: documentFont,
                readerLayout: readerLayout,
                strictLineBreaks: strictLineBreaks,
-               textAlignment: textAlignment).html
+               textAlignment: textAlignment,
+               documentID: documentID,
+               renderExtensionConfiguration: renderExtensionConfiguration).html
     }
 
     static func render(markdown: String,
@@ -298,7 +300,9 @@ nonisolated enum MarkdownHTML {
                        textAlignment: TextAlignmentSetting = .current,
                        warmup: Bool = false,
                        pageTopClearance: CGFloat = 0,
-                       highlightsCode: Bool = true) -> RenderedHTML {
+                       highlightsCode: Bool = true,
+                       documentID: String = "page",
+                       renderExtensionConfiguration: RenderExtensionConfiguration = .allEnabled) -> RenderedHTML {
         let frontmatter = MarkdownFrontmatter.split(markdown)
         let body = frontmatter.body
         let sourceLineOffset: Int
@@ -308,22 +312,39 @@ nonisolated enum MarkdownHTML {
         } else {
             sourceLineOffset = 0
         }
+        // These transforms run before `applyRenderExtensions`; consult its
+        // same snapshot so disabled extensions preserve authored Markdown.
+        let rendersHighlights = renderExtensionConfiguration.isEnabled("highlight")
+        let rendersCallouts = renderExtensionConfiguration.isEnabled("callout")
+        let rendersMath = renderExtensionConfiguration.isEnabled("katex")
         let footnotes = extractFootnotes(from: body)
-        let math = extractMath(from: footnotes.markdown)
+        let math = rendersMath
+            ? extractMath(from: footnotes.markdown)
+            : MathExtraction(
+                processedMarkdown: footnotes.markdown,
+                blocks: [],
+                blockLineCounts: [],
+                inlines: []
+            )
         let formatted = EscapingHTMLFormatter.format(
             math.processedMarkdown,
             sourceLineOffset: sourceLineOffset,
             sourceMarkdown: body,
-            highlightsCode: highlightsCode,
+            highlightsCode: highlightsCode && rendersHighlights,
+            rendersHighlights: rendersHighlights,
+            rendersCallouts: rendersCallouts,
             strictLineBreaks: strictLineBreaks
         )
-        let mermaidResult = renderMermaidBlocks(in: formatted)
-        let mathResult = renderMathBlocks(in: mermaidResult.html, with: math)
-        let footnoteReferenceHTML = renderFootnoteReferences(in: mathResult.html, with: footnotes)
+        let mathHTML = rendersMath ? renderMathBlocks(in: formatted, with: math) : formatted
+        let footnoteReferenceHTML = renderFootnoteReferences(in: mathHTML, with: footnotes)
         let footnoteDefinitions = renderFootnoteDefinitions(
             footnotes,
             sourceLineOffset: sourceLineOffset,
-            strictLineBreaks: strictLineBreaks
+            strictLineBreaks: strictLineBreaks,
+            rendersMath: rendersMath,
+            highlightsCode: highlightsCode && rendersHighlights,
+            rendersHighlights: rendersHighlights,
+            rendersCallouts: rendersCallouts
         )
         let headingsHTML = injectHeadingIDs(in: footnoteReferenceHTML + footnoteDefinitions.html)
         // Direction inference scans every rendered block. Most documents
@@ -343,10 +364,26 @@ nonisolated enum MarkdownHTML {
         } else {
             frontmatterHTML = ""
         }
-        let bodyHTML = frontmatterHTML + renderedBodyHTML
-        let containsMath = mathResult.containsMath || footnoteDefinitions.containsMath
-        let containsMermaid = mermaidResult.containsMermaid || footnoteDefinitions.containsMermaid
-        let containsCode = detectHighlightableCode(in: bodyHTML)
+        // Extensions activate once against complete article HTML: footnotes
+        // are present, and every active extension receives previous active
+        // transforms as input.
+        let extensionRun = applyRenderExtensions(
+            to: frontmatterHTML + renderedBodyHTML,
+            markdown: body,
+            configuration: renderExtensionConfiguration
+        )
+        let bodyHTML = extensionRun.html
+        let activeExtensions = extensionRun.active
+        let extensionAssets = activeExtensions.map { $0.assets(mode: vendorLoading) }
+        // Every page shell carries enabled extension CSS. A later fast-path
+        // swap can therefore activate a CSS-only extension without reloading.
+        // JavaScript remains limited to active extensions below.
+        let extensionCSSAssets = enabledRenderExtensions(
+            configuration: renderExtensionConfiguration
+        ).map { $0.assets(mode: vendorLoading) }
+        let extensionCSS = extensionCSSAssets.map(\.css)
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
         let scrollOverride = allowsScroll ? """
         <style>
         html { overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior-x: none; }
@@ -402,21 +439,26 @@ nonisolated enum MarkdownHTML {
         } ?? ""
         let sanitizerBlock = dompurifyBlock
         let morphBlock = morphdomBlock
-        let mathBlock = containsMath ? katexHead(mode: vendorLoading) : VendorEmission()
-        let mermaidBlock = containsMermaid ? mermaidScript(mode: vendorLoading) : VendorEmission()
-        let highlightBlock = containsCode ? highlightHead(mode: vendorLoading) : VendorEmission()
+        let extensionHeadScripts = extensionAssets.map(\.headJS)
+          .filter { !$0.isEmpty }
+          .joined(separator: "\n")
+        let extensionBodyScripts = extensionAssets.map(\.bodyJS)
+          .filter { !$0.isEmpty }
+        var scriptAssetIDs: Set<String> = []
+        for assets in extensionAssets {
+            scriptAssetIDs.formUnion(assets.scriptAssetIDs)
+        }
         // Inline documents populate the article as soon as its <template> has
         // parsed — before the body-end vendor bundles below it — so the text
         // is paintable while the parser is still working through the JS. The
-        // vendor init IIFEs still see readyState 'loading' at body-end and
-        // keep their DOMContentLoaded wiring; `populateFromTemplate` removes
-        // the template, so the later `start()` populate is a no-op. Under
-        // `.lazy` every emission's body is empty and the populate hook is
-        // skipped, keeping the app-path body unchanged.
+        // body-end lifecycle registrations catch up against that populated
+        // article. `populateFromTemplate` removes the template, so later
+        // `start()` population is a no-op. Under `.lazy` every extension
+        // emission stays in head and the early-populate hook is skipped.
         let earlyPopulate = vendorLoading == .inline
             ? "<script>window.MdPreview && MdPreview.populateNow && MdPreview.populateNow();</script>"
             : ""
-        let bodyParts = [earlyPopulate, mathBlock.body, mermaidBlock.body, highlightBlock.body]
+        let bodyParts = ([earlyPopulate] + extensionBodyScripts)
             .filter { !$0.isEmpty }
         let bodyScripts = bodyParts.isEmpty ? "" : "\n" + bodyParts.joined(separator: "\n")
         // Warmup keeps the article in layout (so Mermaid's IntersectionObserver
@@ -449,6 +491,9 @@ nonisolated enum MarkdownHTML {
         // The Markdown source rides along for copy-as-source. `</` is escaped
         // inside the string literal so a fence containing `</script>` cannot
         // end the element.
+        let documentIDBlock = """
+        <script>window.MdPreview = window.MdPreview || {}; window.MdPreview.documentID = \(javaScriptStringLiteral(documentID).replacingOccurrences(of: "</", with: "<\\/"));</script>
+        """
         let sourceBlock = warmup ? "" : """
         <script>window.MdPreview = window.MdPreview || {}; window.MdPreview.source = \(javaScriptStringLiteral(markdown).replacingOccurrences(of: "</", with: "<\\/"));</script>
         """
@@ -468,6 +513,7 @@ nonisolated enum MarkdownHTML {
         \(baseTag)
         <style>\(stylesheet)</style>
         <style>:root { --mdp-page-top-clearance: \(pageTopClearance)px; }</style>
+        \(extensionCSS.isEmpty ? "" : "<style>\(extensionCSS)</style>")
         \(themeStyleBlock)
         \(scrollOverride)
         \(contentWidthOverride)
@@ -477,10 +523,9 @@ nonisolated enum MarkdownHTML {
         \(sanitizerBlock)
         \(morphBlock)
         \(hostBridgeScript)
+        \(documentIDBlock)
         \(sourceBlock)
-        \(mathBlock.head)
-        \(mermaidBlock.head)
-        \(highlightBlock.head)
+        \(extensionHeadScripts)
         </head>
         <body>
         <article class="markdown-body"\(warmupAttr)\(articleStyle)></article>
@@ -492,9 +537,7 @@ nonisolated enum MarkdownHTML {
             html: html,
             articleHTML: bodyHTML,
             markdown: markdown,
-            containsMath: containsMath,
-            containsMermaid: containsMermaid,
-            containsCode: containsCode
+            scriptAssetIDs: scriptAssetIDs
         )
     }
 
@@ -529,6 +572,5 @@ nonisolated enum MarkdownHTML {
         result += nsHtml.substring(from: cursor)
         return result
     }
-
 
 }

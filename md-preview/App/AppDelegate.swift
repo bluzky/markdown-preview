@@ -149,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             || model.readerLayout != ReaderLayoutSetting.current
             || model.textAlignment != TextAlignmentSetting.current
             || model.strictLineBreaks != StrictLineBreaksSetting.current
+            || model.enabledRenderExtensionIDs != RenderExtensionPreferences.currentConfiguration.enabledIDs
         let languageChanged = model.appLanguage != AppLanguageSetting.selection()
         guard changed || languageChanged else { return }
         model.refreshFromExternalSources()
@@ -369,6 +370,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applyDocumentFontSetting(_ setting: DocumentFontSetting) {
         guard setting != DocumentFontSetting.current else { return }
         DocumentFontSetting.current = setting
+        reloadDocumentPreviewsForSettingChange()
+    }
+
+    /// Re-render open documents with a fresh extension snapshot. Quick Look
+    /// reads same app-group value when it creates its next preview.
+    func applyRenderExtensionPreferences(_ enabledIDs: Set<String>) {
+        let current = RenderExtensionPreferences.currentConfiguration.enabledIDs
+        guard enabledIDs != current else { return }
+        RenderExtensionPreferences.store(
+            enabledIDs: enabledIDs,
+            in: RenderExtensionPreferences.sharedDefaults()
+        )
         reloadDocumentPreviewsForSettingChange()
     }
 

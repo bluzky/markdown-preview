@@ -12,11 +12,8 @@ import Foundation
 nonisolated extension MarkdownHTML {
     // Shared document typography, spacing, and controls. Logical positioning
     // keeps lists, quotations, and table alignment consistent in both directions.
-    /// The shared document stylesheet plus the code highlighting class rules.
-    /// The class rules live here, not with the in-page highlighter, because a
-    /// page whose code arrived highlighted from the renderer never loads that
-    /// runtime, yet its spans still need their colors.
-    static let stylesheet = baseStylesheet + "\n" + highlightThemeCSS
+    /// Shared document stylesheet. Extension CSS is emitted from registry.
+    static let stylesheet = baseStylesheet
 
     private static let baseStylesheet = """
     :root {
@@ -637,8 +634,8 @@ nonisolated extension MarkdownHTML {
         flex: 0 0 auto;
         fill: currentColor;
     }
-    .markdown-alert-note { border-left-color: #0969da; }
-    .markdown-alert-note .markdown-alert-title { color: #0969da; }
+    .markdown-alert-note { border-left-color: var(--link); }
+    .markdown-alert-note .markdown-alert-title { color: var(--link); }
     .markdown-alert-tip { border-left-color: #1a7f37; }
     .markdown-alert-tip .markdown-alert-title { color: #1a7f37; }
     .markdown-alert-important { border-left-color: #8250df; }
@@ -729,6 +726,10 @@ nonisolated extension MarkdownHTML {
         vertical-align: top;
     }
     th { font-weight: 600; }
+    /* The article's overflow-wrap: anywhere would let auto table layout shrink
+       short columns to one letter per line; break-word keeps each column at
+       least as wide as its longest word. */
+    th, td { overflow-wrap: break-word; }
     :is(th, td)[align="center"] { text-align: center; }
     :is(th, td)[align="right"] { text-align: right; }
     :is(th, td)[align="left"] { text-align: left; }
